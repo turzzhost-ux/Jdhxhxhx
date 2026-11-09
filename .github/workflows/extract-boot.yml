@@ -1,0 +1,794 @@
+name: Extract boot & vendor_boot from OTA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ota_url:
+        description: "URL OTA zip (full atau incremental)"
+        required: true
+        default: "https://android.googleapis.com/packages/ota-api/package/286d976cba6889ff5225714c2f9e24192ae20b8c.zip"
+      partitions:
+        description: "Partisi yang diextract (pisah koma)"
+        required: true
+        default: "boot,vendor_boot"
+      old_boot_url:
+        description: "[Incremental] URL boot.img build LAMA (pre-build)"
+        required: false
+        default: ""
+      old_vendor_boot_url:
+        description: "[Incremental] URL vendor_boot.img build LAMA (pre-build)"
+        required: false
+        default: ""
+      old_ota_url:
+        description: "[Incremental] ALTERNATIF: URL FULL OTA build LAMA (otomatis diextract)"
+        required: false
+        default: ""
+      strict_validation:
+        description: "Warning dianggap error (ketat)"
+        type: boolean
+        default: false
+      publish_release:
+        description: "Upload hasil ke GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  WORKDIR: /mnt/work
+  OUTDIR: ${{ github.workspace }}/out
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. CLEANUP AGRESIF
+      # ------------------------------------------------------------------
+      - name: Free up disk space (aggressive)
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "::group::Disk BEFORE"
+          df -h /
+          BEFORE=$(df --output=avail -B1 / | tail -n1)
+          echo "::endgroup::"
+
+          DIRS=(
+            /usr/share/dotnet
+            /usr/share/swift
+            /usr/share/miniconda
+            /usr/share/az_*
+            /usr/local/lib/android
+            /usr/local/lib/node_modules
+            /usr/local/share/boost
+            /usr/local/share/chromium
+            /usr/local/share/powershell
+            /usr/local/julia*
+            /usr/local/.ghcup
+            /opt/ghc
+            /opt/az
+            /opt/microsoft
+            /opt/google
+            /opt/hostedtoolcache
+            /opt/pipx
+            /home/linuxbrew
+            /home/runner/.dotnet
+            /home/runner/.rustup
+            /home/runner/.cargo
+            /home/runner/.nvm
+            /home/runner/.rbenv
+            /home/runner/.ghcup
+            /home/runner/.cache
+            /home/runner/.gradle
+            /imagegeneration
+            /var/lib/apt/lists
+            /var/cache/apt
+            /var/lib/mysql
+            /var/lib/snapd
+            /var/lib/gems
+          )
+
+          echo "::group::Removing big directories"
+          for d in "${DIRS[@]}"; do
+            for p in $d; do
+              if [ -e "$p" ]; then
+                echo "rm -> $p"
+                sudo rm -rf "$p" &
+              fi
+            done
+          done
+          wait
+          echo "::endgroup::"
+
+          echo "::group::Purging apt packages"
+          sudo apt-get remove -y -qq --fix-missing \
+            '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' '^mongodb-.*' '^mysql-.*' \
+            '^postgresql-.*' '^php.*' '^mono-.*' '^temurin-.*' '^openjdk-.*' \
+            azure-cli google-cloud-cli google-cloud-sdk google-chrome-stable \
+            microsoft-edge-stable firefox powershell mssql-tools unixodbc-dev \
+            snapd 2>/dev/null || true
+          sudo apt-get autoremove -y -qq || true
+          sudo apt-get clean -qq || true
+          echo "::endgroup::"
+
+          echo "::group::Docker prune"
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker system prune -af --volumes || true
+            sudo docker builder prune -af || true
+            sudo docker image prune -af || true
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Disable swap"
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          echo "::endgroup::"
+
+          sudo journalctl --vacuum-size=1M >/dev/null 2>&1 || true
+          sudo find /var/log -type f -exec truncate -s 0 {} + 2>/dev/null || true
+          sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+
+          AFTER=$(df --output=avail -B1 / | tail -n1)
+          FREED=$(( (AFTER - BEFORE) / 1024 / 1024 / 1024 ))
+
+          echo "::group::Disk AFTER"
+          df -h /
+          echo "::endgroup::"
+
+          {
+            echo "### 🧹 Disk cleanup"
+            echo ""
+            echo "| Sebelum | Sesudah | Kebebasan |"
+            echo "|---|---|---|"
+            echo "| $((BEFORE/1024/1024/1024)) GB | $((AFTER/1024/1024/1024)) GB | **+${FREED} GB** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. PERSIAPAN
+      # ------------------------------------------------------------------
+      - name: Prepare dirs (workdir di /mnt)
+        run: |
+          sudo mkdir -p "$WORKDIR"
+          sudo chown -R "$USER":"$(id -gn)" "$WORKDIR"
+          mkdir -p "$OUTDIR"
+          df -h /mnt /
+
+      - name: Install image validator
+        run: |
+          cat > "$WORKDIR/validate_img.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Validator image keluarga boot: magic, header, ukuran, AVB footer, hash."""
+          import argparse, hashlib, json, os, struct, sys
+
+          VALID_PAGES = {2048, 4096, 8192, 16384, 32768, 65536}
+          DTBO_MAGIC = bytes.fromhex("d7b7ab1e")
+
+
+          def align(n, a):
+              return (n + a - 1) // a * a
+
+
+          def u32(b, o):
+              return struct.unpack_from("<I", b, o)[0]
+
+
+          def decode_os(v):
+              if not v:
+                  return None, None
+              ver, pat = v >> 11, v & 0x7FF
+              ver_s = f"{(ver >> 14) & 0x7F}.{(ver >> 7) & 0x7F}.{ver & 0x7F}"
+              pat_s = f"{((pat >> 4) & 0x7F) + 2000:04d}-{pat & 0xF:02d}"
+              return ver_s, pat_s
+
+
+          def sha256_of(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def detect_kind(magic):
+              if magic == b"ANDROID!":
+                  return "boot"
+              if magic == b"VNDRBOOT":
+                  return "vendor"
+              if magic[:4] == b"AVB0":
+                  return "vbmeta"
+              if magic[:4] == DTBO_MAGIC:
+                  return "dtbo"
+              return "unknown"
+
+
+          def expected_kind(name):
+              if name in ("boot", "init_boot", "recovery"):
+                  return "boot"
+              if name in ("vendor_boot", "vendor_kernel_boot"):
+                  return "vendor"
+              if name.startswith("vbmeta"):
+                  return "vbmeta"
+              if name == "dtbo":
+                  return "dtbo"
+              return None
+
+
+          def check_image(path, meta_patch):
+              base = os.path.basename(path)
+              name = base[:-4] if base.endswith(".img") else base
+              r = {"file": base, "size": 0, "sha256": "-", "kind": "?",
+                   "errors": [], "warnings": [], "info": []}
+              err, warn, info = r["errors"].append, r["warnings"].append, r["info"].append
+
+              try:
+                  size = os.path.getsize(path)
+              except OSError as e:
+                  err(f"kaga bisa dibaca: {e}")
+                  return r
+              r["size"] = size
+              if size == 0:
+                  err("file kosong (0 byte)")
+                  return r
+              if size < 8192:
+                  err(f"kekecilan ({size} byte), pasti korup")
+                  return r
+              if size % 4096:
+                  warn(f"ukuran {size} bukan kelipatan 4096")
+
+              with open(path, "rb") as f:
+                  head = f.read(8192)
+                  f.seek(size - 64)
+                  tail = f.read(64)
+
+                  kind = detect_kind(head[:8])
+                  r["kind"] = kind
+                  want = expected_kind(name)
+                  if kind == "unknown":
+                      err(f"magic kaga dikenal: {head[:8]!r}")
+                      return r
+                  if want and kind != want:
+                      err(f"magic salah: kebaca '{kind}', harusnya '{want}' buat {name}")
+                      return r
+                  if not want:
+                      warn(f"partisi '{name}' kaga dikenal, cek struktur dilewat")
+
+                  exp = None  # ukuran minimum menurut header
+                  os_patch = None
+
+                  # ---------------- boot / init_boot / recovery ----------------
+                  if kind == "boot":
+                      hv = u32(head, 40)
+                      info(f"header v{hv}")
+                      if hv > 4:
+                          err(f"versi header ngaco: {hv}")
+                          return r
+                      if hv >= 3:
+                          ksz, rsz, os_v = u32(head, 8), u32(head, 12), u32(head, 16)
+                          page = 4096
+                          exp = page + align(ksz, page) + align(rsz, page)
+                          if hv == 4:
+                              exp += align(u32(head, 1580), page)
+                      else:
+                          ksz, rsz, ssz = u32(head, 8), u32(head, 16), u32(head, 24)
+                          page, os_v = u32(head, 36), u32(head, 44)
+                          if page not in VALID_PAGES:
+                              err(f"page_size kaga masuk akal: {page}")
+                              return r
+                          exp = page + align(ksz, page) + align(rsz, page) + align(ssz, page)
+                          if hv >= 1:
+                              exp += align(u32(head, 1632), page)
+                          if hv == 2:
+                              exp += align(u32(head, 1648), page)
+                      info(f"kernel={ksz} ramdisk={rsz}")
+                      if name == "boot" and ksz == 0:
+                          err("kernel_size = 0 di boot.img")
+                      if name == "init_boot" and rsz == 0:
+                          err("ramdisk_size = 0 di init_boot.img")
+                      osv, osp = decode_os(os_v)
+                      if osv:
+                          info(f"os={osv} patch={osp}")
+                          os_patch = osp
+
+                  # ---------------- vendor_boot ----------------
+                  elif kind == "vendor":
+                      hv, page = u32(head, 8), u32(head, 12)
+                      info(f"header v{hv} page={page}")
+                      if hv not in (3, 4):
+                          err(f"versi header vendor_boot kaga valid: {hv}")
+                          return r
+                      if page not in VALID_PAGES:
+                          err(f"page_size kaga masuk akal: {page}")
+                          return r
+                      rsz, hdr, dtb = u32(head, 24), u32(head, 2096), u32(head, 2100)
+                      if name == "vendor_boot":
+                          exp = align(hdr, page) + align(rsz, page) + align(dtb, page)
+                          if hv == 4:
+                              exp += align(u32(head, 2112), page) + align(u32(head, 2124), page)
+                      info(f"ramdisk={rsz} dtb={dtb}")
+                      if rsz == 0:
+                          warn("vendor_ramdisk_size = 0")
+
+                  if exp is not None:
+                      r["expected_min"] = exp
+                      if exp > size:
+                          err(f"TERPOTONG: header minta >= {exp} byte, file cuma {size}")
+                          return r
+
+                  # ---------------- AVB footer ----------------
+                  if kind in ("boot", "vendor", "dtbo"):
+                      if tail[:4] == b"AVBf":
+                          major, minor = struct.unpack(">II", tail[4:12])
+                          orig, vb_off, vb_size = struct.unpack(">QQQ", tail[12:36])
+                          info(f"AVB footer v{major}.{minor}")
+                          if orig > size or vb_off + vb_size > size:
+                              err("AVB footer nunjuk di luar ukuran file")
+                          else:
+                              f.seek(vb_off)
+                              if f.read(4) != b"AVB0":
+                                  err("vbmeta di dalam image rusak (magic AVB0 kaga ketemu)")
+                              else:
+                                  info("vbmeta embedded OK")
+                              if exp is not None and orig < exp:
+                                  warn(f"original_image_size ({orig}) < ukuran header ({exp})")
+                      else:
+                          warn("AVB footer kaga ada")
+
+                  # ---------------- area data kaga boleh kosong ----------------
+                  f.seek(4096)
+                  blob = f.read(65536)
+                  if blob and not any(blob):
+                      err("area data awal full 0x00 (image kosong)")
+                  elif blob and blob.count(0xFF) == len(blob):
+                      err("area data awal full 0xFF (image kosong)")
+
+              # ---------------- cocokin patch level dengan metadata OTA ----------------
+              if os_patch and meta_patch:
+                  if os_patch != meta_patch[:7]:
+                      warn(f"patch header {os_patch} != metadata OTA {meta_patch[:7]}")
+                  else:
+                      info("patch level cocok metadata OTA")
+
+              r["sha256"] = sha256_of(path)
+              return r
+
+
+          def read_meta_patch(path):
+              if not path or not os.path.isfile(path):
+                  return None
+              for line in open(path, errors="ignore"):
+                  if line.startswith("post-security-patch-level="):
+                      return line.split("=", 1)[1].strip()
+              return None
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--dir", required=True)
+              ap.add_argument("--expect-parts", default="")
+              ap.add_argument("--meta", default="")
+              ap.add_argument("--label", default="Validasi image")
+              ap.add_argument("--report", default="")
+              ap.add_argument("--strict", action="store_true")
+              a = ap.parse_args()
+
+              meta_patch = read_meta_patch(a.meta)
+              expected = [p.strip() for p in a.expect_parts.split(",") if p.strip()]
+              present = sorted(x for x in os.listdir(a.dir) if x.endswith(".img")) if os.path.isdir(a.dir) else []
+
+              results = []
+              for p in expected:
+                  if f"{p}.img" not in present:
+                      results.append({"file": f"{p}.img", "size": 0, "sha256": "-", "kind": "-",
+                                      "errors": ["kaga ada di hasil"], "warnings": [], "info": []})
+              for fn in present:
+                  results.append(check_image(os.path.join(a.dir, fn), meta_patch))
+
+              n_err = n_warn = 0
+              rows = []
+              for r in results:
+                  n_err += len(r["errors"])
+                  n_warn += len(r["warnings"])
+                  status = "❌" if r["errors"] else ("⚠️" if r["warnings"] else "✅")
+                  print(f"{status} {r['file']}  size={r['size']}  sha256={r['sha256'][:16]}")
+                  for m in r["info"]:
+                      print(f"    · {m}")
+                  for m in r["warnings"]:
+                      print(f"::warning title={r['file']}::{m}")
+                  for m in r["errors"]:
+                      print(f"::error title={r['file']}::{m}")
+                  detail = "; ".join(r["errors"] + r["warnings"] + r["info"])
+                  rows.append(f"| {status} | `{r['file']}` | {r['size']:,} | `{r['sha256'][:12]}` | {detail} |")
+
+              summ = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summ:
+                  with open(summ, "a") as f:
+                      f.write(f"### 🔍 {a.label}\n\n| | File | Byte | SHA256 | Detail |\n|---|---|---|---|---|\n")
+                      f.write("\n".join(rows) + f"\n\nError: **{n_err}**, Warning: **{n_warn}**\n\n")
+
+              if a.report:
+                  with open(a.report, "w") as f:
+                      json.dump({"errors": n_err, "warnings": n_warn, "images": results}, f, indent=2)
+
+              if n_err or (a.strict and n_warn):
+                  print(f"GAGAL: {n_err} error, {n_warn} warning (strict={a.strict})")
+                  sys.exit(1)
+              print(f"LOLOS: {len(results)} image, {n_warn} warning")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          chmod +x "$WORKDIR/validate_img.py"
+          python3 -m py_compile "$WORKDIR/validate_img.py"
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 unzip xz-utils jq ethtool curl git \
+            python3 python3-venv python3-dev build-essential
+
+      # ------------------------------------------------------------------
+      # 3. NETWORK BOOST
+      # ------------------------------------------------------------------
+      - name: Boost network (TCP tuning + DNS)
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+          echo "Interface: ${IFACE:-unknown}"
+
+          echo "::group::Before"
+          sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
+          echo "::endgroup::"
+
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo modprobe sch_fq 2>/dev/null || true
+
+          sudo tee /etc/sysctl.d/99-netboost.conf >/dev/null <<'EOF'
+          net.core.default_qdisc = fq
+          net.ipv4.tcp_congestion_control = bbr
+
+          net.core.rmem_max = 67108864
+          net.core.wmem_max = 67108864
+          net.core.rmem_default = 1048576
+          net.core.wmem_default = 1048576
+          net.ipv4.tcp_rmem = 4096 1048576 67108864
+          net.ipv4.tcp_wmem = 4096 1048576 67108864
+
+          net.core.netdev_max_backlog = 250000
+          net.core.somaxconn = 65535
+          net.ipv4.tcp_max_syn_backlog = 65535
+
+          net.ipv4.tcp_window_scaling = 1
+          net.ipv4.tcp_sack = 1
+          net.ipv4.tcp_fastopen = 3
+          net.ipv4.tcp_mtu_probing = 1
+          net.ipv4.tcp_slow_start_after_idle = 0
+          net.ipv4.tcp_no_metrics_save = 1
+          net.ipv4.tcp_fin_timeout = 15
+          net.ipv4.tcp_tw_reuse = 1
+          net.ipv4.ip_local_port_range = 10240 65535
+          EOF
+          sudo sysctl --system >/dev/null 2>&1 || true
+
+          if [ -n "${IFACE:-}" ] && command -v ethtool >/dev/null 2>&1; then
+            sudo ethtool -K "$IFACE" gro on gso on tso on 2>/dev/null || true
+          fi
+          [ -n "${IFACE:-}" ] && sudo ip link set dev "$IFACE" txqueuelen 10000 2>/dev/null || true
+
+          if command -v resolvectl >/dev/null 2>&1 && [ -n "${IFACE:-}" ]; then
+            sudo resolvectl dns "$IFACE" 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 2>/dev/null || true
+            sudo resolvectl flush-caches 2>/dev/null || true
+          fi
+
+          echo "::group::After"
+          sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc \
+                 net.core.rmem_max net.core.wmem_max 2>/dev/null || true
+          echo "::endgroup::"
+
+          {
+            echo "### 🚀 Network boost"
+            echo "- Congestion control: \`$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)\`"
+            echo "- Qdisc: \`$(sysctl -n net.core.default_qdisc 2>/dev/null)\`"
+            echo "- Interface: \`${IFACE:-unknown}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 4. DOWNLOAD OTA (TURBO)
+      # ------------------------------------------------------------------
+      - name: Download OTA package (turbo)
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          URL: ${{ inputs.ota_url }}
+        run: |
+          set -uo pipefail
+          START=$(date +%s)
+
+          echo "::group::Probe server"
+          curl -sIL --max-time 20 "$URL" | grep -iE "^(HTTP|content-length|accept-ranges|content-type)" || true
+          echo "::endgroup::"
+
+          echo "::group::aria2c"
+          aria2c \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --max-concurrent-downloads=1 \
+            --file-allocation=none \
+            --continue=true \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --max-tries=10 \
+            --retry-wait=3 \
+            --timeout=30 \
+            --connect-timeout=15 \
+            --lowest-speed-limit=100K \
+            --disable-ipv6=true \
+            --async-dns=false \
+            --enable-http-pipelining=true \
+            --stream-piece-selector=geom \
+            --summary-interval=10 \
+            --console-log-level=warn \
+            -o ota.zip "$URL"
+          RC=$?
+          echo "::endgroup::"
+
+          if [ $RC -ne 0 ] || [ ! -s ota.zip ]; then
+            echo "::warning::aria2c gagal (rc=$RC), fallback ke curl"
+            curl -fL --retry 10 --retry-delay 3 --retry-all-errors \
+                 --connect-timeout 15 -C - -o ota.zip "$URL"
+          fi
+
+          END=$(date +%s)
+          SIZE=$(stat -c%s ota.zip)
+          SECS=$(( END - START )); [ $SECS -lt 1 ] && SECS=1
+          MBPS=$(( SIZE / 1024 / 1024 / SECS ))
+
+          ls -lh ota.zip
+          unzip -tq ota.zip >/dev/null || { echo "::error::ota.zip korup / bukan zip valid"; exit 1; }
+
+          {
+            echo "### ⬇️ Download"
+            echo "| Ukuran | Waktu | Rata-rata |"
+            echo "|---|---|---|"
+            echo "| $((SIZE/1024/1024)) MB | ${SECS}s | **~${MBPS} MB/s** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 5. CEK METADATA (deteksi FULL / INCREMENTAL)
+      # ------------------------------------------------------------------
+      - name: Inspect OTA metadata
+        id: meta
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          unzip -l ota.zip | grep -E "payload.bin|payload_properties|metadata" || true
+
+          if ! unzip -l ota.zip | grep -q "payload.bin"; then
+            echo "::error::payload.bin kaga ada, ini bukan A/B OTA"
+            exit 1
+          fi
+
+          unzip -o -q ota.zip "META-INF/com/android/metadata" -d meta || true
+          META=meta/META-INF/com/android/metadata
+
+          INCR=false; BUILD=unknown; PRE=""
+          if [ -f "$META" ]; then
+            cat "$META"
+            echo "-----"
+            if grep -q "^pre-build=" "$META"; then
+              INCR=true
+              PRE=$(grep -E "^pre-build-incremental=" "$META" | cut -d= -f2- || true)
+              echo "::warning::OTA INCREMENTAL. Butuh image lama build ${PRE}"
+            fi
+            BUILD=$(grep -E "^post-build=" "$META" | cut -d= -f2- | tr '/:' '__' || true)
+          fi
+
+          echo "build=${BUILD:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "incremental=$INCR" >> "$GITHUB_OUTPUT"
+          echo "pre=$PRE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 📋 OTA info"
+            echo "- Tipe: **$([ "$INCR" = true ] && echo INCREMENTAL || echo FULL)**"
+            echo "- Build: \`${BUILD:-unknown}\`"
+            [ -n "$PRE" ] && echo "- Butuh image lama build: \`$PRE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 6. EXTRACT PAYLOAD
+      # ------------------------------------------------------------------
+      - name: Extract payload.bin
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          unzip -o ota.zip payload.bin payload_properties.txt
+          ls -lh payload.bin
+          rm -f ota.zip   # hemat disk
+
+      - name: Get payload-dumper-go
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download --repo ssut/payload-dumper-go \
+            --pattern '*linux_amd64.tar.gz' --output pdg.tar.gz
+          tar -xzf pdg.tar.gz
+          chmod +x payload-dumper-go
+          ./payload-dumper-go -h 2>&1 | head -n 5 || true
+
+      # ------------------------------------------------------------------
+      # 7. IMAGE LAMA (khusus INCREMENTAL)
+      # ------------------------------------------------------------------
+      - name: Fetch old images (incremental only)
+        if: ${{ steps.meta.outputs.incremental == 'true' }}
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          OLD_BOOT: ${{ inputs.old_boot_url }}
+          OLD_VENDOR_BOOT: ${{ inputs.old_vendor_boot_url }}
+          OLD_OTA: ${{ inputs.old_ota_url }}
+          PARTS: ${{ inputs.partitions }}
+          PRE: ${{ steps.meta.outputs.pre }}
+        run: |
+          set -euo pipefail
+          mkdir -p old
+
+          if [ -n "$OLD_OTA" ]; then
+            echo "::group::Old FULL OTA -> extract"
+            aria2c -x 16 -s 16 -k 4M --max-tries=5 --retry-wait=5 \
+              --console-log-level=warn --summary-interval=15 \
+              -o old_ota.zip "$OLD_OTA"
+            unzip -tq old_ota.zip >/dev/null || { echo "::error::old_ota.zip korup"; exit 1; }
+            if ! unzip -l old_ota.zip | grep -q "payload.bin"; then
+              echo "::error::old_ota_url bukan A/B OTA"; exit 1
+            fi
+            if unzip -p old_ota.zip META-INF/com/android/metadata 2>/dev/null | grep -q "^pre-build="; then
+              echo "::error::old_ota_url juga incremental. Harus FULL OTA."; exit 1
+            fi
+            mkdir -p old_payload
+            unzip -o old_ota.zip payload.bin -d old_payload
+            rm -f old_ota.zip
+            ./payload-dumper-go -p "$PARTS" -o old old_payload/payload.bin
+            rm -rf old_payload
+            echo "::endgroup::"
+          else
+            [ -n "$OLD_BOOT" ]        && curl -fL --retry 5 --retry-all-errors -o old/boot.img "$OLD_BOOT"
+            [ -n "$OLD_VENDOR_BOOT" ] && curl -fL --retry 5 --retry-all-errors -o old/vendor_boot.img "$OLD_VENDOR_BOOT"
+          fi
+
+          IFS=',' read -ra P <<< "$PARTS"
+          for p in "${P[@]}"; do
+            p=$(echo "$p" | xargs)
+            if [ ! -s "old/$p.img" ]; then
+              echo "::error::OTA incremental (butuh build ${PRE}) tapi old/$p.img kaga ada. Isi old_boot_url/old_vendor_boot_url, old_ota_url, atau pakai Full OTA."
+              exit 1
+            fi
+          done
+
+          ls -lh old/
+          sha256sum old/*.img
+
+      - name: Validate old images (incremental only)
+        if: ${{ steps.meta.outputs.incremental == 'true' }}
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          PARTS: ${{ inputs.partitions }}
+          STRICT: ${{ inputs.strict_validation }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          [ "$STRICT" = "true" ] && ARGS+=(--strict)
+          python3 validate_img.py \
+            --dir old \
+            --expect-parts "$PARTS" \
+            --label "Validasi image LAMA (basis patch)" \
+            "${ARGS[@]}"
+
+      # ------------------------------------------------------------------
+      # 8. DUMP
+      # ------------------------------------------------------------------
+      - name: Dump selected partitions
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          PARTS: ${{ inputs.partitions }}
+          INCR: ${{ steps.meta.outputs.incremental }}
+        run: |
+          set -euo pipefail
+          if [ "$INCR" = "true" ]; then
+            echo "Mode: INCREMENTAL (payload_dumper --diff)"
+            git clone --depth 1 https://github.com/vm03/payload_dumper.git pd
+            python3 -m venv venv
+            ./venv/bin/pip install -q --upgrade pip setuptools wheel
+            ./venv/bin/pip install -q -r pd/requirements.txt
+            ./venv/bin/python pd/payload_dumper.py \
+              --diff --old old \
+              --images "$PARTS" \
+              --out "$OUTDIR" \
+              payload.bin
+          else
+            echo "Mode: FULL (payload-dumper-go)"
+            ./payload-dumper-go -p "$PARTS" -o "$OUTDIR" payload.bin
+          fi
+          ls -lh "$OUTDIR"
+
+      # ------------------------------------------------------------------
+      # 9. VALIDASI + VERIFIKASI HASIL
+      # ------------------------------------------------------------------
+      - name: Validate output images
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          PARTS: ${{ inputs.partitions }}
+          STRICT: ${{ inputs.strict_validation }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          [ "$STRICT" = "true" ] && ARGS+=(--strict)
+          python3 validate_img.py \
+            --dir "$OUTDIR" \
+            --expect-parts "$PARTS" \
+            --meta meta/META-INF/com/android/metadata \
+            --report "$OUTDIR/validation-report.json" \
+            --label "Validasi image HASIL" \
+            "${ARGS[@]}"
+
+      - name: Verify results & checksums
+        working-directory: ${{ env.OUTDIR }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra PARTS <<< "${{ inputs.partitions }}"
+          for p in "${PARTS[@]}"; do
+            p=$(echo "$p" | xargs)
+            if [ -s "$p.img" ]; then
+              echo "OK  $p.img ($(stat -c%s "$p.img") bytes)"
+            else
+              echo "::warning::$p.img kaga ada di payload (device mungkin kaga punya partisi ini)"
+            fi
+          done
+
+          ls *.img >/dev/null 2>&1 || { echo "::error::Kaga ada image yang berhasil diextract"; exit 1; }
+
+          sha256sum *.img | tee SHA256SUMS.txt
+          {
+            echo "### Hasil ekstraksi"
+            echo ""
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 10. UPLOAD
+      # ------------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-images-${{ steps.meta.outputs.build }}
+          path: |
+            ${{ env.OUTDIR }}/*.img
+            ${{ env.OUTDIR }}/SHA256SUMS.txt
+            ${{ env.OUTDIR }}/validation-report.json
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: boot-${{ github.run_number }}
+          name: "boot images (run #${{ github.run_number }})"
+          body: |
+            Build: `${{ steps.meta.outputs.build }}`
+            Type: `${{ steps.meta.outputs.incremental == 'true' && 'incremental' || 'full' }}`
+            Source: `${{ inputs.ota_url }}`
+          files: |
+            ${{ env.OUTDIR }}/*.img
+            ${{ env.OUTDIR }}/SHA256SUMS.txt
+            ${{ env.OUTDIR }}/validation-report.json
