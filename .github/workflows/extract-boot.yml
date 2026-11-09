@@ -1,0 +1,287 @@
+name: Extract boot & vendor_boot from OTA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ota_url:
+        description: "URL OTA zip"
+        required: true
+        default: "https://android.googleapis.com/packages/ota-api/package/286d976cba6889ff5225714c2f9e24192ae20b8c.zip"
+      partitions:
+        description: "Partisi yang diextract (pisah koma)"
+        required: true
+        default: "boot,vendor_boot"
+      publish_release:
+        description: "Upload hasil ke GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  WORKDIR: /mnt/work
+  OUTDIR: ${{ github.workspace }}/out
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. CLEANUP AGRESIF
+      # ------------------------------------------------------------------
+      - name: Free up disk space (aggressive)
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "::group::Disk BEFORE"
+          df -h /
+          BEFORE=$(df --output=avail -B1 / | tail -n1)
+          echo "::endgroup::"
+
+          # ---------- Hapus direktori toolchain gede (paralel) ----------
+          DIRS=(
+            /usr/share/dotnet
+            /usr/share/swift
+            /usr/share/miniconda
+            /usr/share/az_*
+            /usr/local/lib/android
+            /usr/local/lib/node_modules
+            /usr/local/share/boost
+            /usr/local/share/chromium
+            /usr/local/share/powershell
+            /usr/local/julia*
+            /usr/local/.ghcup
+            /opt/ghc
+            /opt/az
+            /opt/microsoft
+            /opt/google
+            /opt/hostedtoolcache
+            /opt/pipx
+            /home/linuxbrew
+            /home/runner/.dotnet
+            /home/runner/.rustup
+            /home/runner/.cargo
+            /home/runner/.nvm
+            /home/runner/.rbenv
+            /home/runner/.ghcup
+            /home/runner/.cache
+            /home/runner/.gradle
+            /imagegeneration
+            /var/lib/apt/lists
+            /var/cache/apt
+            /var/lib/mysql
+            /var/lib/snapd
+            /var/lib/gems
+          )
+
+          echo "::group::Removing big directories"
+          for d in "${DIRS[@]}"; do
+            for p in $d; do
+              if [ -e "$p" ]; then
+                echo "rm -> $p"
+                sudo rm -rf "$p" &
+              fi
+            done
+          done
+          wait
+          echo "::endgroup::"
+
+          # ---------- Purge paket apt gede ----------
+          echo "::group::Purging apt packages"
+          sudo apt-get remove -y -qq --fix-missing \
+            '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' '^mongodb-.*' '^mysql-.*' \
+            '^postgresql-.*' '^php.*' '^mono-.*' '^temurin-.*' '^openjdk-.*' \
+            azure-cli google-cloud-cli google-cloud-sdk google-chrome-stable \
+            microsoft-edge-stable firefox powershell mssql-tools unixodbc-dev \
+            snapd 2>/dev/null || true
+          sudo apt-get autoremove -y -qq || true
+          sudo apt-get clean -qq || true
+          echo "::endgroup::"
+
+          # ---------- Docker ----------
+          echo "::group::Docker prune"
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker system prune -af --volumes || true
+            sudo docker builder prune -af || true
+            sudo docker image prune -af || true
+          fi
+          echo "::endgroup::"
+
+          # ---------- Swap ----------
+          echo "::group::Disable swap"
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          echo "::endgroup::"
+
+          # ---------- Log, journal, tmp ----------
+          sudo journalctl --vacuum-size=1M >/dev/null 2>&1 || true
+          sudo find /var/log -type f -exec truncate -s 0 {} + 2>/dev/null || true
+          sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+
+          # ---------- Report ----------
+          AFTER=$(df --output=avail -B1 / | tail -n1)
+          FREED=$(( (AFTER - BEFORE) / 1024 / 1024 / 1024 ))
+
+          echo "::group::Disk AFTER"
+          df -h /
+          echo "::endgroup::"
+
+          {
+            echo "### 🧹 Disk cleanup"
+            echo ""
+            echo "| Sebelum | Sesudah | Kebebasan |"
+            echo "|---|---|---|"
+            echo "| $((BEFORE/1024/1024/1024)) GB | $((AFTER/1024/1024/1024)) GB | **+${FREED} GB** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. PERSIAPAN
+      # ------------------------------------------------------------------
+      - name: Prepare dirs (workdir di /mnt)
+        run: |
+          sudo mkdir -p "$WORKDIR"
+          sudo chown -R "$USER":"$(id -gn)" "$WORKDIR"
+          mkdir -p "$OUTDIR"
+          df -h /mnt /
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 unzip xz-utils jq
+
+      # ------------------------------------------------------------------
+      # 3. DOWNLOAD OTA
+      # ------------------------------------------------------------------
+      - name: Download OTA package
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          URL="${{ inputs.ota_url }}"
+          echo "::group::Downloading"
+          aria2c -x 16 -s 16 -k 4M \
+            --max-tries=5 --retry-wait=5 \
+            --summary-interval=15 \
+            -o ota.zip "$URL"
+          echo "::endgroup::"
+
+          ls -lh ota.zip
+          unzip -tq ota.zip >/dev/null || { echo "::error::ota.zip korup / bukan zip valid"; exit 1; }
+
+      # ------------------------------------------------------------------
+      # 4. CEK METADATA
+      # ------------------------------------------------------------------
+      - name: Inspect OTA metadata
+        id: meta
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          unzip -l ota.zip | grep -E "payload.bin|payload_properties|metadata" || true
+
+          if ! unzip -l ota.zip | grep -q "payload.bin"; then
+            echo "::error::payload.bin kaga ada, ini bukan A/B OTA"
+            exit 1
+          fi
+
+          unzip -o -q ota.zip "META-INF/com/android/metadata" -d meta || true
+
+          if [ -f meta/META-INF/com/android/metadata ]; then
+            cat meta/META-INF/com/android/metadata
+            echo "-----"
+            if grep -q "^pre-build=" meta/META-INF/com/android/metadata; then
+              echo "::error::OTA ini INCREMENTAL (butuh build lama). Pakai FULL OTA."
+              exit 1
+            fi
+            BUILD=$(grep -E "^post-build=" meta/META-INF/com/android/metadata | cut -d= -f2- | tr '/:' '__' || true)
+            echo "build=${BUILD:-unknown}" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------------------
+      # 5. EXTRACT PAYLOAD
+      # ------------------------------------------------------------------
+      - name: Extract payload.bin
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          unzip -o ota.zip payload.bin payload_properties.txt
+          ls -lh payload.bin
+          rm -f ota.zip   # hemat disk
+
+      - name: Get payload-dumper-go
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download --repo ssut/payload-dumper-go \
+            --pattern '*linux_amd64.tar.gz' --output pdg.tar.gz
+          tar -xzf pdg.tar.gz
+          chmod +x payload-dumper-go
+          ./payload-dumper-go -h 2>&1 | head -n 5 || true
+
+      - name: Dump selected partitions
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          ./payload-dumper-go -p "${{ inputs.partitions }}" -o "$OUTDIR" payload.bin
+          ls -lh "$OUTDIR"
+
+      # ------------------------------------------------------------------
+      # 6. VERIFIKASI
+      # ------------------------------------------------------------------
+      - name: Verify results & checksums
+        working-directory: ${{ env.OUTDIR }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra PARTS <<< "${{ inputs.partitions }}"
+          for p in "${PARTS[@]}"; do
+            p=$(echo "$p" | xargs)
+            if [ -s "$p.img" ]; then
+              echo "OK  $p.img ($(stat -c%s "$p.img") bytes)"
+            else
+              echo "::warning::$p.img kaga ada di payload (device mungkin kaga punya partisi ini)"
+            fi
+          done
+
+          ls *.img >/dev/null 2>&1 || { echo "::error::Kaga ada image yang berhasil diextract"; exit 1; }
+
+          sha256sum *.img | tee SHA256SUMS.txt
+          {
+            echo "### Hasil ekstraksi"
+            echo ""
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 7. UPLOAD
+      # ------------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-images-${{ steps.meta.outputs.build }}
+          path: |
+            ${{ env.OUTDIR }}/*.img
+            ${{ env.OUTDIR }}/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: boot-${{ github.run_number }}
+          name: "boot images (run #${{ github.run_number }})"
+          body: |
+            Build: `${{ steps.meta.outputs.build }}`
+            Source: `${{ inputs.ota_url }}`
+          files: |
+            ${{ env.OUTDIR }}/*.img
+            ${{ env.OUTDIR }}/SHA256SUMS.txt
